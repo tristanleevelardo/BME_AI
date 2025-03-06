@@ -1,66 +1,104 @@
-from flask import Flask, request, jsonify
+import os
+import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from flask import Flask, request, jsonify
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import joblib
 
 app = Flask(__name__)
 
-# Load dataset
-dataset_path = "BMIDataset.csv"
-df = pd.read_csv(dataset_path)
+# Define paths to the saved outputs in the trainingOutputs folder
+output_folder = "trainingOutputs"
+model_path = os.path.join(output_folder, "nutrient_prediction_nn.h5")
+scaler_path = os.path.join(output_folder, "scaler.pkl")
+encoders_path = os.path.join(output_folder, "meal_label_encoders.pkl")
 
-# Select relevant columns for model training
-df_selected = df[["BMI", "Age", "Physical_Activity_Level", "Allergens", "Diet_Recommendation"]].copy()
+# 1) Load the trained model and preprocessing tools
+loaded_model = load_model(model_path, custom_objects={'mse': tf.keras.losses.MeanSquaredError()})
+scaler = joblib.load(scaler_path)
+label_encoders = joblib.load(encoders_path)
 
-# Encode the target variable (Diet_Recommendation) into numerical values
-encoder_diet = LabelEncoder()
-df_selected["Diet_Recommendation"] = encoder_diet.fit_transform(df_selected["Diet_Recommendation"])
-
-# Split data into features (X) and target (y)
-X = df_selected.drop(columns=["Diet_Recommendation"])
-y = df_selected["Diet_Recommendation"]
-
-# Split dataset into training (80%) and testing (20%) sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Train a Random Forest model
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
+# 2) Load the original dataset for meal suggestions (ensure this dataset matches your training data)
+df = pd.read_csv("dataset/dataset.csv")
+# Convert Gender to numeric (Male -> 0, Female -> 1)
+df["Gender"] = df["Gender"].map({"Male": 0, "Female": 1})
 
 @app.route("/predict", methods=["POST"])
 def predict():
     """
-    API endpoint to predict diet recommendation based on user input.
-    Expected JSON input:
+    Expects a JSON body with:
     {
-        "BMI": float,
-        "Age": int,
-        "Physical_Activity_Level": int (1-5),
-        "Allergens": int (0-5)
+      "age": <number>,
+      "gender": "Male" or "Female",
+      "bmi": <number>,
+      "bmr": <number>
     }
+    
+    Returns a JSON response with:
+      "Suggested nutrients per day": {
+            "Daily Calorie Target": <value>,
+            "Protein (g)": <value>,
+            "Carbohydrates (g)": <value>,
+            "Fat (g)": <value>
+      },
+      "Suggested meals": [ <meal1>, <meal2>, <meal3>, ... ]
     """
-    try:
-        # Get JSON data from request
-        data = request.get_json()
+    data = request.json
 
-        # Extract user inputs
-        bmi = data["BMI"]
-        age = data["Age"]
-        activity_level = data["Physical_Activity_Level"]
-        allergens = data["Allergens"]
+    # Extract user inputs
+    age = data.get("age")
+    gender_str = data.get("gender")
+    bmi = data.get("bmi")
+    bmr = data.get("bmr")
 
-        # Prepare input data for model prediction
-        user_input = [[bmi, age, activity_level, allergens]]
-        prediction = model.predict(user_input)
+    # Validate inputs
+    if any(v is None for v in [age, gender_str, bmi, bmr]):
+        return jsonify({"error": "Missing required fields: age, gender, bmi, bmr"}), 400
 
-        # Convert predicted numerical label back to diet category
-        recommended_diet = encoder_diet.inverse_transform(prediction)[0]
+    # Convert gender to numeric (Male -> 0, Female -> 1)
+    gender = 0 if gender_str.lower() == "male" else 1
 
-        return jsonify({"Recommended Diet": recommended_diet})
+    # Prepare input data for model prediction
+    input_data = np.array([[age, gender, bmi, bmr]])
+    input_data_scaled = scaler.transform(input_data)
 
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    # Predict numeric nutrition values using the loaded model
+    numeric_prediction = loaded_model.predict(input_data_scaled)[0]
+    cal_target = round(numeric_prediction[0])
+    protein = round(numeric_prediction[1])
+    carbs = round(numeric_prediction[2])
+    fat = round(numeric_prediction[3])
+
+    # Build a dictionary for the suggested nutrients per day
+    suggested_nutrients = {
+        "Daily Calorie Target": cal_target,
+        "Protein (g)": protein,
+        "Carbohydrates (g)": carbs,
+        "Fat (g)": fat
+    }
+
+    # Find the closest matching record in the dataset for meal suggestions
+    user_features = np.array([age, gender, bmi, bmr])
+    diff = df[["Age", "Gender", "BMI", "BMR"]].apply(lambda row: np.abs(row.values - user_features).sum(), axis=1)
+    closest_idx = diff.idxmin()
+
+    # Extract meal suggestions from the closest matching record
+    meal_suggestions = df.loc[closest_idx, ["Breakfast Suggestion", "Lunch Suggestion", "Dinner Suggestion", "Snack Suggestion"]].to_dict()
+    meal_list = [
+        meal_suggestions.get("Breakfast Suggestion"),
+        meal_suggestions.get("Lunch Suggestion"),
+        meal_suggestions.get("Dinner Suggestion"),
+        meal_suggestions.get("Snack Suggestion")
+    ]
+
+    # Build the response
+    response = {
+        "Suggested nutrients per day": suggested_nutrients,
+        "Suggested meals": meal_list
+    }
+
+    return jsonify(response), 200
 
 if __name__ == "__main__":
     app.run(debug=True)
